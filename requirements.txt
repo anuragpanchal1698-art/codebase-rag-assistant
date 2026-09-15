@@ -1,0 +1,21 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch
+
+langchain>=0.3.0
+langchain-community
+langchain-openai
+langchain-text-splitters
+langgraph
+qdrant-client
+rank-bm25
+sentence-transformers
+langchain-huggingface
+langchain-mcp-adapters
+mcp
+python-dotenv
+tiktoken
+GitPython
+pygithub
+fastapi
+uvicorn[standard]
+pypdf

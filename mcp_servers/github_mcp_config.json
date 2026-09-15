@@ -1,0 +1,11 @@
+{
+  "_comment": "Optional: swap the PyGithub-based tool in agent/tools.py for a real MCP server using langchain-mcp-adapters. Example config for the official GitHub MCP server (if you install/run it separately):",
+  "github": {
+    "command": "npx",
+    "args": ["-y", "@modelcontextprotocol/server-github"],
+    "env": {
+      "GITHUB_PERSONAL_ACCESS_TOKEN": "your_token_here"
+    },
+    "transport": "stdio"
+  }
+}
