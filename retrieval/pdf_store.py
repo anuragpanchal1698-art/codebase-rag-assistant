@@ -1,16 +1,18 @@
 """
-PDF-only retrieval system.
+PDF-only retrieval system with chat isolation.
 
-Retrieves ONLY from the uploaded PDF collection.
+Retrieves ONLY from uploaded PDF files belonging to the
+current chat.
 
-The retrieval system:
-    1. Uses dense semantic search
-    2. Uses BM25 keyword search
-    3. Combines results with RRF
-    4. Expands relevant chunks with nearby chunks
-    5. Keeps expansion inside the same PDF/section when possible
+Retrieval:
+    1. Dense semantic search
+    2. BM25 keyword search
+    3. Reciprocal Rank Fusion
+    4. Neighbor chunk expansion
+    5. Chat-based filtering
 
-No poem names, story names, or question types are hardcoded.
+Every PDF chunk is associated with a chat_id so PDFs from
+different conversations can never be mixed.
 """
 
 import re
@@ -46,7 +48,6 @@ _client = None
 _pdf_bm25 = None
 _pdf_bm25_corpus = None
 
-# Number of neighboring chunks added around a relevant chunk.
 NEIGHBOR_RADIUS = 2
 
 
@@ -105,11 +106,26 @@ def ensure_pdf_collection():
 
 def embed_and_store_pdf_chunks(
     chunks: list[dict],
+    chat_id: str,
     batch_size: int = 32,
 ):
+    """
+    Embed and store PDF chunks belonging to one chat.
+
+    chat_id is stored in BOTH:
+        - Qdrant payload
+        - BM25 metadata
+
+    This guarantees that retrieval can be isolated per chat.
+    """
 
     if not chunks:
         return
+
+    if not chat_id:
+        raise ValueError(
+            "chat_id is required when storing PDF chunks."
+        )
 
     embedder = get_embedder()
 
@@ -149,10 +165,19 @@ def embed_and_store_pdf_chunks(
                 uuid.uuid4()
             )
 
-            metadata = chunk.get(
-                "metadata",
-                {},
+            metadata = dict(
+                chunk.get(
+                    "metadata",
+                    {},
+                )
             )
+
+            # ------------------------------------------------
+            # IMPORTANT:
+            # Associate this chunk with the current chat.
+            # ------------------------------------------------
+
+            metadata["chat_id"] = chat_id
 
             payload = {
                 "content": chunk["content"],
@@ -283,8 +308,15 @@ def _get_pdf_bm25():
 
 def sparse_search_pdfs(
     query: str,
+    chat_id: str,
     top_k: int = 20,
 ) -> list[dict]:
+    """
+    BM25 search restricted to the current chat.
+    """
+
+    if not chat_id:
+        return []
 
     bm25, corpus = (
         _get_pdf_bm25()
@@ -327,28 +359,52 @@ def sparse_search_pdfs(
             {},
         )
 
+        # ----------------------------------------------------
+        # CHAT ISOLATION
+        # ----------------------------------------------------
+
+        if metadata.get(
+            "chat_id"
+        ) != chat_id:
+
+            continue
+
         results.append(
             {
                 "id": entry["id"],
+
                 "score": float(
                     scores[i]
                 ),
+
                 "content": entry[
                     "content"
                 ],
+
                 "source": metadata.get(
                     "source",
                     "unknown",
                 ),
+
                 "page": metadata.get(
                     "page"
                 ),
+
                 "section": metadata.get(
                     "section",
                     "",
                 ),
+
                 "chunk_index": metadata.get(
                     "chunk_index"
+                ),
+
+                "part": metadata.get(
+                    "part"
+                ),
+
+                "chat_id": metadata.get(
+                    "chat_id"
                 ),
             }
         )
@@ -362,10 +418,17 @@ def sparse_search_pdfs(
 
 def search_pdfs(
     query: str,
+    chat_id: str,
     top_k: int = 20,
 ) -> list[dict]:
+    """
+    Dense semantic search restricted to the current chat.
+    """
 
     if not query.strip():
+        return []
+
+    if not chat_id:
         return []
 
     embedder = get_embedder()
@@ -387,9 +450,26 @@ def search_pdfs(
 
         return []
 
+    # --------------------------------------------------------
+    # IMPORTANT:
+    # Qdrant only searches chunks belonging to this chat.
+    # --------------------------------------------------------
+
+    chat_filter = Filter(
+        must=[
+            FieldCondition(
+                key="chat_id",
+                match=MatchValue(
+                    value=chat_id
+                ),
+            )
+        ]
+    )
+
     results = client.query_points(
         collection_name=PDF_COLLECTION,
         query=query_vector,
+        query_filter=chat_filter,
         limit=top_k,
     ).points
 
@@ -437,6 +517,10 @@ def search_pdfs(
                 "part": payload.get(
                     "part"
                 ),
+
+                "chat_id": payload.get(
+                    "chat_id"
+                ),
             }
         )
 
@@ -449,7 +533,14 @@ def search_pdfs(
 
 def get_pdf_chunks(
     source: str,
+    chat_id: str,
 ) -> list[dict]:
+    """
+    Get chunks from one PDF belonging to one chat only.
+    """
+
+    if not source or not chat_id:
+        return []
 
     client = get_client()
 
@@ -466,10 +557,29 @@ def get_pdf_chunks(
 
     offset = None
 
+    chat_filter = Filter(
+        must=[
+            FieldCondition(
+                key="chat_id",
+                match=MatchValue(
+                    value=chat_id
+                ),
+            ),
+
+            FieldCondition(
+                key="source",
+                match=MatchValue(
+                    value=source
+                ),
+            ),
+        ]
+    )
+
     while True:
 
         points, offset = client.scroll(
             collection_name=PDF_COLLECTION,
+            scroll_filter=chat_filter,
             limit=100,
             offset=offset,
             with_payload=True,
@@ -480,12 +590,6 @@ def get_pdf_chunks(
             payload = (
                 point.payload or {}
             )
-
-            if payload.get(
-                "source"
-            ) != source:
-
-                continue
 
             records.append(
                 {
@@ -519,14 +623,20 @@ def get_pdf_chunks(
                     "part": payload.get(
                         "part"
                     ),
+
+                    "chat_id": payload.get(
+                        "chat_id"
+                    ),
                 }
             )
 
         if offset is None:
             break
 
-    # New chunker provides chunk_index.
-    # Fall back to page/part for older data.
+    # --------------------------------------------------------
+    # Preserve document order.
+    # --------------------------------------------------------
+
     records.sort(
         key=lambda x: (
             x.get(
@@ -567,30 +677,20 @@ def get_pdf_chunks(
 
 def expand_with_neighbors(
     results: list[dict],
+    chat_id: str,
     radius: int = NEIGHBOR_RADIUS,
 ) -> list[dict]:
     """
-    For every relevant result, retrieve nearby chunks.
-
-    This is the important part for stories/poems.
-
-    Example:
-
-        chunk 20 = matching discussion question
-        chunk 19 = poem
-        chunk 18 = poem
-        chunk 21 = poem
-
-    The surrounding content can now be supplied to the LLM.
-
-    When section metadata exists, expansion stays inside
-    the same section whenever possible.
+    Expand relevant chunks using nearby chunks from the
+    SAME PDF and SAME CHAT.
     """
 
     if not results:
         return []
 
-    # Cache complete PDFs only when necessary.
+    if not chat_id:
+        return []
+
     source_cache = {}
 
     expanded = {}
@@ -608,7 +708,8 @@ def expand_with_neighbors(
 
             source_cache[source] = (
                 get_pdf_chunks(
-                    source
+                    source,
+                    chat_id,
                 )
             )
 
@@ -618,10 +719,6 @@ def expand_with_neighbors(
 
         if not all_chunks:
             continue
-
-        # ----------------------------------------------------
-        # Locate matching chunk.
-        # ----------------------------------------------------
 
         result_id = result.get(
             "id"
@@ -651,10 +748,6 @@ def expand_with_neighbors(
             or ""
         )
 
-        # ----------------------------------------------------
-        # Add nearby chunks.
-        # ----------------------------------------------------
-
         start = max(
             0,
             index - radius,
@@ -677,8 +770,8 @@ def expand_with_neighbors(
                 or ""
             )
 
-            # If both chunks have section information,
-            # do not cross into another section.
+            # Keep expansion within the same section
+            # whenever both sections are known.
             if (
                 target_section
                 and neighbor_section
@@ -690,10 +783,6 @@ def expand_with_neighbors(
             expanded[
                 neighbor["id"]
             ] = neighbor
-
-    # --------------------------------------------------------
-    # Preserve document order.
-    # --------------------------------------------------------
 
     output = list(
         expanded.values()
@@ -744,11 +833,13 @@ def expand_with_neighbors(
 
 def find_relevant_pdf(
     query: str,
+    chat_id: str,
     min_score: float = 0.30,
 ) -> tuple[str | None, float]:
 
     results = search_pdfs(
         query,
+        chat_id=chat_id,
         top_k=20,
     )
 
@@ -759,8 +850,6 @@ def find_relevant_pdf(
             0.0,
         )
 
-    # Find strongest source rather than blindly
-    # assuming result 0 is always the best document.
     best_by_source = {}
 
     for result in results:
@@ -820,19 +909,19 @@ def find_relevant_pdf(
 
 def hybrid_search_pdfs(
     query: str,
+    chat_id: str,
     top_k: int = 10,
     rrf_k: int = 60,
     min_dense_score: float = 0.30,
 ) -> list[dict]:
     """
-    Hybrid semantic + BM25 retrieval.
-
-    After finding relevant chunks, neighboring chunks are
-    automatically added so the LLM receives enough context
-    to understand the actual story/poem/document section.
+    Hybrid semantic + BM25 retrieval restricted to one chat.
     """
 
     if not query.strip():
+        return []
+
+    if not chat_id:
         return []
 
     # --------------------------------------------------------
@@ -841,11 +930,17 @@ def hybrid_search_pdfs(
 
     dense_results = search_pdfs(
         query,
+        chat_id=chat_id,
         top_k=20,
     )
 
     print(
         "\n========== PDF RETRIEVAL =========="
+    )
+
+    print(
+        "CHAT:",
+        chat_id,
     )
 
     print(
@@ -910,6 +1005,7 @@ def hybrid_search_pdfs(
 
     sparse_results = sparse_search_pdfs(
         query,
+        chat_id=chat_id,
         top_k=20,
     )
 
@@ -926,7 +1022,7 @@ def hybrid_search_pdfs(
     ]
 
     # --------------------------------------------------------
-    # RECIPROCAL RANK FUSION
+    # RRF
     # --------------------------------------------------------
 
     fused_scores = {}
@@ -981,13 +1077,14 @@ def hybrid_search_pdfs(
     ]
 
     # --------------------------------------------------------
-    # EXPAND CONTEXT
+    # NEIGHBOR EXPANSION
     # --------------------------------------------------------
 
     expanded_results = (
         expand_with_neighbors(
             primary_results,
-            radius=2,
+            chat_id=chat_id,
+            radius=NEIGHBOR_RADIUS,
         )
     )
 
@@ -1012,7 +1109,15 @@ def hybrid_search_pdfs(
 # LIST UPLOADED PDFS
 # ============================================================
 
-def list_uploaded_pdfs() -> list[str]:
+def list_uploaded_pdfs(
+    chat_id: str,
+) -> list[str]:
+    """
+    Return PDFs belonging ONLY to the specified chat.
+    """
+
+    if not chat_id:
+        return []
 
     client = get_client()
 
@@ -1029,10 +1134,22 @@ def list_uploaded_pdfs() -> list[str]:
 
     offset = None
 
+    chat_filter = Filter(
+        must=[
+            FieldCondition(
+                key="chat_id",
+                match=MatchValue(
+                    value=chat_id
+                ),
+            )
+        ]
+    )
+
     while True:
 
         records, offset = client.scroll(
             collection_name=PDF_COLLECTION,
+            scroll_filter=chat_filter,
             limit=100,
             offset=offset,
             with_payload=True,
@@ -1068,7 +1185,14 @@ def list_uploaded_pdfs() -> list[str]:
 
 def delete_pdf(
     doc_name: str,
+    chat_id: str,
 ):
+    """
+    Delete a PDF ONLY from the specified chat.
+    """
+
+    if not doc_name or not chat_id:
+        return
 
     client = get_client()
 
@@ -1081,21 +1205,32 @@ def delete_pdf(
         return
 
     # --------------------------------------------------------
-    # Delete Qdrant points.
+    # Delete Qdrant points belonging to:
+    #
+    # current chat + requested PDF
     # --------------------------------------------------------
+
+    delete_filter = Filter(
+        must=[
+            FieldCondition(
+                key="chat_id",
+                match=MatchValue(
+                    value=chat_id
+                ),
+            ),
+
+            FieldCondition(
+                key="source",
+                match=MatchValue(
+                    value=doc_name
+                ),
+            ),
+        ]
+    )
 
     client.delete(
         collection_name=PDF_COLLECTION,
-        points_selector=Filter(
-            must=[
-                FieldCondition(
-                    key="source",
-                    match=MatchValue(
-                        value=doc_name
-                    ),
-                )
-            ]
-        ),
+        points_selector=delete_filter,
     )
 
     # --------------------------------------------------------
@@ -1112,12 +1247,103 @@ def delete_pdf(
     filtered = [
         entry
         for entry in corpus
+        if not (
+            entry.get(
+                "metadata",
+                {},
+            ).get(
+                "source"
+            ) == doc_name
+            and entry.get(
+                "metadata",
+                {},
+            ).get(
+                "chat_id"
+            ) == chat_id
+        )
+    ]
+
+    try:
+
+        with open(
+            PDF_BM25_PATH,
+            "wb",
+        ) as f:
+
+            pickle.dump(
+                filtered,
+                f,
+            )
+
+    except Exception:
+        pass
+
+    _pdf_bm25 = None
+    _pdf_bm25_corpus = None
+
+
+# ============================================================
+# DELETE ALL PDFs FOR A CHAT
+# ============================================================
+
+def delete_chat_pdfs(
+    chat_id: str,
+):
+    """
+    Delete every PDF belonging to one chat.
+
+    This will be used when the user deletes a chat.
+    """
+
+    if not chat_id:
+        return
+
+    client = get_client()
+
+    collections = [
+        c.name
+        for c in client.get_collections().collections
+    ]
+
+    if PDF_COLLECTION not in collections:
+        return
+
+    chat_filter = Filter(
+        must=[
+            FieldCondition(
+                key="chat_id",
+                match=MatchValue(
+                    value=chat_id
+                ),
+            )
+        ]
+    )
+
+    client.delete(
+        collection_name=PDF_COLLECTION,
+        points_selector=chat_filter,
+    )
+
+    # --------------------------------------------------------
+    # Remove BM25 entries for this chat.
+    # --------------------------------------------------------
+
+    global _pdf_bm25
+    global _pdf_bm25_corpus
+
+    corpus = (
+        _load_pdf_bm25_corpus()
+    )
+
+    filtered = [
+        entry
+        for entry in corpus
         if entry.get(
             "metadata",
             {},
         ).get(
-            "source"
-        ) != doc_name
+            "chat_id"
+        ) != chat_id
     ]
 
     try:
